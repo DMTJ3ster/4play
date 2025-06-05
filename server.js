@@ -5,18 +5,26 @@ const socketIo = require('socket.io');
 const path = require('path');
 const fs = require('fs');
 const sanitizeHtml = require('sanitize-html');
+const { ExpressPeerServer } = require('peer');
 
 // Configuration
 const config = {
   PORT: process.env.PORT || 3000,
   ADMIN_PWD: process.env.ADMIN_PWD || 'securePassword123',
   MAX_PLAYERS: process.env.MAX_PLAYERS || 8,
-  GAME_TIMEOUT: process.env.GAME_TIMEOUT || 3600000,
-  WEBCAM_TIMEOUT: 20000 // 20 seconds for webcam tasks
+  GAME_TIMEOUT: process.env.GAME_TIMEOUT || 3600000
 };
 
 const app = express();
 const server = http.createServer(app);
+
+// Create PeerJS server
+const peerServer = ExpressPeerServer(server, {
+  path: '/peerjs',
+  proxied: true
+});
+app.use('/peerjs', peerServer);
+
 const io = socketIo(server, {
   perMessageDeflate: {
     threshold: 1024,
@@ -32,7 +40,8 @@ const io = socketIo(server, {
 const baseBonusChance = 0.10;
 const rareBonusChance = 0.03;
 const predefinedTasks = [
-  { task: "REMOVE AN ITEM OF CLOTHING", imageUrl: "/images/CLOTHES.jpg", category: "RISKY", points: 3, requiresWebcam: true },
+  { task: "REMOVE AN ITEM OF CLOTHING", imageUrl: "/images/CLOTHES.jpg", category: "RISKY", points: 3 },
+  { task: "20 SEC TEASE", imageUrl: "/images/FANTASY.jpg", category: "INTIMATE", points: 2, isWebcamTask: true },
   { task: "DESCRIBE A FANTASY", imageUrl: "/images/FANTASY.jpg", category: "INTIMATE", points: 2 },
   { task: "TRUTH OR DARE", imageUrl: "/images/CLOTHES.jpg", category: "RISKY", points: 2 },
   { task: "ASK A QUESTION", imageUrl: "/images/QUESTION.jpg", category: "MILD", points: 1 },
@@ -190,6 +199,7 @@ if (!gameState.gameStartTime) {
 setInterval(cleanupDisconnectedPlayers, 60000);
 
 app.use(express.static('public'));
+app.use(express.json());
 
 // Routes
 app.get('/', (req, res) => {
@@ -243,6 +253,9 @@ io.on('connection', (socket) => {
     
     socket.emit('sessionToken', sessionToken);
     io.emit('updatePlayers', gameState.players, gameState.players[gameState.currentPlayerIndex]?.id);
+    
+    // Send list of all player IDs to new connection
+    socket.emit('playerList', gameState.players.map(p => p.id));
     
     io.emit('receiveMessage', {
       player: 'System',
@@ -304,16 +317,12 @@ io.on('connection', (socket) => {
       io.emit('showSkipMessage', gameState.players.find(p => p.id === socket.id).name);
     }
 
-    if (task.requiresWebcam) {
-      gameState.activeWebcam = socket.id;
-      io.emit('activateWebcam', socket.id, config.WEBCAM_TIMEOUT);
-      
-      setTimeout(() => {
-        if (gameState.activeWebcam === socket.id) {
-          gameState.activeWebcam = null;
-          io.emit('deactivateWebcam');
-        }
-      }, config.WEBCAM_TIMEOUT);
+    // Show webcam for clothing removal and tease tasks
+    if (task.task === "REMOVE AN ITEM OF CLOTHING" || task.isWebcamTask) {
+      console.log('Emitting showWebcam for webcam task:', task.task);
+      io.to(player.id).emit('showWebcam', player.name, true, task.task);
+      socket.broadcast.emit('showWebcam', player.name, false, task.task);
+      gameState.activeWebcam = player.id;
     }
 
     if (task.isSpecial) {
@@ -390,10 +399,12 @@ io.on('connection', (socket) => {
     
     const newTask = { 
       task: sanitizeHtml(taskData.text.trim(), { allowedTags: [], allowedAttributes: {} }).substring(0, 100),
-      imageUrl: "/images/default.jpg",
+      imageUrl: taskData.imageUrl || "/images/default.jpg",
       category: taskData.category || "CUSTOM",
       points: parseInt(taskData.points) || 1
     };
+    
+    console.log('Creating new task with imageUrl:', newTask.imageUrl);
     
     if (!gameState.playerTasks[socket.id]) gameState.playerTasks[socket.id] = [];
     gameState.playerTasks[socket.id].push(newTask);
@@ -437,6 +448,60 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Webcam events
+  socket.on('webcamStarted', (token) => {
+    if (!verifySession(socket.id, token)) return;
+    
+    const player = gameState.players.find(p => p.id === socket.id);
+    if (player) {
+      gameState.activeWebcam = socket.id;
+      io.emit('webcamStatusUpdate', {
+        active: true,
+        playerName: player.name,
+        playerId: socket.id
+      });
+      io.emit('receiveMessage', {
+        player: 'System',
+        message: `${player.name} started their camera for the webcam task`,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    }
+  });
+
+  socket.on('webcamStopped', (token) => {
+    if (!verifySession(socket.id, token)) return;
+    
+    const player = gameState.players.find(p => p.id === socket.id);
+    if (player && gameState.activeWebcam === socket.id) {
+      gameState.activeWebcam = null;
+      io.emit('webcamStatusUpdate', {
+        active: false,
+        playerName: player.name,
+        playerId: socket.id
+      });
+      io.emit('receiveMessage', {
+        player: 'System',
+        message: `${player.name} stopped their camera`,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    }
+  });
+
+  socket.on('webcamClosed', (token) => {
+    if (!verifySession(socket.id, token)) return;
+    
+    if (gameState.activeWebcam === socket.id) {
+      const player = gameState.players.find(p => p.id === socket.id);
+      gameState.activeWebcam = null;
+      io.emit('webcamStatusUpdate', {
+        active: false,
+        playerName: player ? player.name : 'Unknown',
+        playerId: socket.id
+      });
+      io.emit('hideWebcam');
+    }
+  });
+
   // Handle disconnection
   socket.on('disconnect', () => {
     connectedSockets.delete(socket.id);
@@ -444,6 +509,16 @@ io.on('connection', (socket) => {
     
     if (player) {
       player.lastSeen = Date.now();
+      
+      // Clean up webcam if this player was using it
+      if (gameState.activeWebcam === socket.id) {
+        gameState.activeWebcam = null;
+        io.emit('hideWebcam');
+      }
+      
+      // Notify other players about disconnection
+      io.emit('playerDisconnected', socket.id);
+      
       saveGameState();
       
       io.emit('receiveMessage', {
